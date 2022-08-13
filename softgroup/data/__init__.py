@@ -4,6 +4,7 @@ from torch.utils.data.distributed import DistributedSampler
 from .s3dis import S3DISDataset
 from .scannetv2 import ScanNetDataset
 from .stpls3d import STPLS3DDataset
+from .deploy import Deploy
 
 __all__ = ['S3DISDataset', 'ScanNetDataset', 'build_dataset']
 
@@ -19,6 +20,8 @@ def build_dataset(data_cfg, logger):
         return ScanNetDataset(**_data_cfg)
     elif data_type == 'stpls3d':
         return STPLS3DDataset(**_data_cfg)
+    elif data_type == 'deploy':
+        return Deploy(**_data_cfg)
     else:
         raise ValueError(f'Unknown {data_type}')
 

@@ -179,6 +179,26 @@ class CustomDataset(Dataset):
         semantic_label = torch.from_numpy(semantic_label)
         instance_label = torch.from_numpy(instance_label)
         pt_offset_label = torch.from_numpy(pt_offset_label)
+
+        #print(type(scan_id))
+        #print(len(coord))
+        #print(len(coord_float))
+        #print(len(feat))
+        #print(len(semantic_label))
+        #print(len(instance_label))
+        #print(type(inst_num))
+        #print(len(inst_pointnum))
+        #print(len(inst_cls))
+        #print(len(pt_offset_label))
+        #print((xyz))
+        #print((coord))
+        #print((coord_float))
+        #print((feat))
+        #print((semantic_label))
+        #print((instance_label))
+        #print(data)
+        #print()
+
         return (scan_id, coord, coord_float, feat, semantic_label, instance_label, inst_num,
                 inst_pointnum, inst_cls, pt_offset_label)
 
