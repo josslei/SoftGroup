@@ -1,6 +1,9 @@
 ## General
 
 
+# checkpoint files, pytorch data files
+*.pth
+
 # Compiled Object files
 *.slo
 *.lo
