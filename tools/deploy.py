@@ -30,7 +30,16 @@ def getData():
     coord, feat, semantic_label, instance_label = tools.loadPth(POINT_CLOUD_PATH)
     coord_middle = tools.getXYZMiddle(coord)
     inst_num, inst_pointnum, inst_cls, pt_offset_label = tools.getInstanceInfo(coord_middle, instance_label.astype(np.int32), semantic_label)
+
+    voxel_coords = p2v_map = v2p_map = spatial_shape = torch.from_numpy(np.ascontiguousarray(coord.copy())).float()
+
+    coord = torch.from_numpy(coord).long()
+    feat = torch.from_numpy(feat).float()
+    semantic_label = torch.from_numpy(semantic_label)
+    instance_label = torch.from_numpy(instance_label)
+    coord_float = torch.from_numpy(coord_middle)
     # ---
+    # softgroup/data/custom.py
     #instance_label[np.where(instance_label != -100)] += total_inst_num
     #total_inst_num += inst_num
     #scan_ids.append(scan_id)
@@ -43,6 +52,26 @@ def getData():
     #instance_cls.extend(inst_cls)
     #pt_offset_labels.append(pt_offset_label)
     #batch_id += 1
+    #voxel_coord, v2p_map, p2v_map = tools.voxelization_idx(coord, 0)
+    #spatial_shape = np.clip(
+    #   coord.max(0)[0][1:].numpy() + 1, self.voxel_cfg.spatial_shape[0], None)
+    return {
+        'scan_ids': 1,
+        'coords': coord,
+        'batch_idxs': 1,
+        'voxel_coords': voxel_coords,
+        'p2v_map': p2v_map,
+        'v2p_map': v2p_map,
+        'coords_float': coord_float,
+        'feats': feat,
+        'semantic_labels': semantic_label,
+        'instance_labels': instance_label,
+        'instance_pointnum': inst_pointnum,
+        'instance_cls': inst_cls,
+        'pt_offset_labels': pt_offset_label,
+        'spatial_shape': None,
+        'batch_size': spatial_shape
+    }
 
 if __name__ == "__main__":
     args = get_args()
@@ -65,7 +94,7 @@ if __name__ == "__main__":
     # (coord, feat, semantic_label, instance_label)
     # labels are default to be zero
 
-    getData()
+    data = getData()
 
     with torch.no_grad():
         model.eval()
