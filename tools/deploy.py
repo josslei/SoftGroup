@@ -1,21 +1,21 @@
 import argparse
+import multiprocessing as mp
+import os
+import os.path as osp
 
 import numpy as np
 import torch
 import yaml
 from munch import Munch
 from softgroup.data import build_dataloader, build_dataset
-
+from softgroup.evaluation import (ScanNetEval, evaluate_offset_mae, evaluate_semantic_acc,
+                                  evaluate_semantic_miou)
 from softgroup.model import SoftGroup
-from softgroup.util import load_checkpoint
-from softgroup.util import (init_dist, get_root_logger)
-
+from softgroup.util import (collect_results_gpu, get_dist_info, get_root_logger, init_dist,
+                            is_main_process, load_checkpoint, rle_decode)
 from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
-import tools_deploy as tools
-
-POINT_CLOUD_PATH = "../sp-data/preprocessed-raw-point-cloud/0_preprocessed-raw.pth"
 
 def get_args():
     parser = argparse.ArgumentParser('SoftGroup')
@@ -26,78 +26,138 @@ def get_args():
     args = parser.parse_args()
     return args
 
-def getData():
-    coord, feat, semantic_label, instance_label = tools.loadPth(POINT_CLOUD_PATH)
-    coord_middle = tools.getXYZMiddle(coord)
-    inst_num, inst_pointnum, inst_cls, pt_offset_label = tools.getInstanceInfo(coord_middle, instance_label.astype(np.int32), semantic_label)
 
-    voxel_coords = p2v_map = v2p_map = spatial_shape = torch.from_numpy(np.ascontiguousarray(coord.copy())).float()
+def save_npy(root, name, scan_ids, arrs):
+    root = osp.join(root, name)
+    os.makedirs(root, exist_ok=True)
+    paths = [osp.join(root, f'{i}.npy') for i in scan_ids]
+    pool = mp.Pool()
+    pool.starmap(np.save, zip(paths, arrs))
+    pool.close()
+    pool.join()
 
-    coord = torch.from_numpy(coord).long()
-    feat = torch.from_numpy(feat).float()
-    semantic_label = torch.from_numpy(semantic_label)
-    instance_label = torch.from_numpy(instance_label)
-    coord_float = torch.from_numpy(coord_middle)
-    # ---
-    # softgroup/data/custom.py
-    #instance_label[np.where(instance_label != -100)] += total_inst_num
-    #total_inst_num += inst_num
-    #scan_ids.append(scan_id)
-    #coords.append(torch.cat([coord.new_full((coord.size(0), 1), batch_id), coord], 1))
-    #coords_float.append(coord_float)
-    #feats.append(feat)
-    #semantic_labels.append(semantic_label)
-    #instance_labels.append(instance_label)
-    #instance_pointnum.extend(inst_pointnum)
-    #instance_cls.extend(inst_cls)
-    #pt_offset_labels.append(pt_offset_label)
-    #batch_id += 1
-    #voxel_coord, v2p_map, p2v_map = tools.voxelization_idx(coord, 0)
-    #spatial_shape = np.clip(
-    #   coord.max(0)[0][1:].numpy() + 1, self.voxel_cfg.spatial_shape[0], None)
-    return {
-        'scan_ids': 1,
-        'coords': coord,
-        'batch_idxs': 1,
-        'voxel_coords': voxel_coords,
-        'p2v_map': p2v_map,
-        'v2p_map': v2p_map,
-        'coords_float': coord_float,
-        'feats': feat,
-        'semantic_labels': semantic_label,
-        'instance_labels': instance_label,
-        'instance_pointnum': inst_pointnum,
-        'instance_cls': inst_cls,
-        'pt_offset_labels': pt_offset_label,
-        'spatial_shape': None,
-        'batch_size': spatial_shape
-    }
 
-if __name__ == "__main__":
+def save_single_instance(root, scan_id, insts, nyu_id=None):
+    f = open(osp.join(root, f'{scan_id}.txt'), 'w')
+    os.makedirs(osp.join(root, 'predicted_masks'), exist_ok=True)
+    for i, inst in enumerate(insts):
+        assert scan_id == inst['scan_id']
+        label_id = inst['label_id']
+        # scannet dataset use nyu_id for evaluation
+        if nyu_id is not None:
+            label_id = nyu_id[label_id - 1]
+        conf = inst['conf']
+        f.write(f'predicted_masks/{scan_id}_{i:03d}.txt {label_id} {conf:.4f}\n')
+        mask_path = osp.join(root, 'predicted_masks', f'{scan_id}_{i:03d}.txt')
+        mask = rle_decode(inst['pred_mask'])
+        np.savetxt(mask_path, mask, fmt='%d')
+    f.close()
+
+
+def save_pred_instances(root, name, scan_ids, pred_insts, nyu_id=None):
+    root = osp.join(root, name)
+    os.makedirs(root, exist_ok=True)
+    roots = [root] * len(scan_ids)
+    nyu_ids = [nyu_id] * len(scan_ids)
+    pool = mp.Pool()
+    pool.starmap(save_single_instance, zip(roots, scan_ids, pred_insts, nyu_ids))
+    pool.close()
+    pool.join()
+
+
+def save_gt_instance(path, gt_inst, nyu_id=None):
+    if nyu_id is not None:
+        sem = gt_inst // 1000
+        ignore = sem == 0
+        ins = gt_inst % 1000
+        nyu_id = np.array(nyu_id)
+        sem = nyu_id[sem - 1]
+        sem[ignore] = 0
+        gt_inst = sem * 1000 + ins
+    np.savetxt(path, gt_inst, fmt='%d')
+
+
+def save_gt_instances(root, name, scan_ids, gt_insts, nyu_id=None):
+    root = osp.join(root, name)
+    os.makedirs(root, exist_ok=True)
+    paths = [osp.join(root, f'{i}.txt') for i in scan_ids]
+    pool = mp.Pool()
+    nyu_ids = [nyu_id] * len(scan_ids)
+    pool.starmap(save_gt_instance, zip(paths, gt_insts, nyu_ids))
+    pool.close()
+    pool.join()
+
+
+def main():
     args = get_args()
     cfg_txt = open(args.config, 'r').read()
     cfg = Munch.fromDict(yaml.safe_load(cfg_txt))
     if args.dist:
         init_dist()
-    logger = get_root_logger()  # logger creates logs
+    logger = get_root_logger()
 
     model = SoftGroup(**cfg.model).cuda()
     if args.dist:
         model = DistributedDataParallel(model, device_ids=[torch.cuda.current_device()])
     logger.info(f'Load state dict from {args.checkpoint}')
-    # [0] path_to_checkpoint; [1] to write logs; [2] model instance
     load_checkpoint(args.checkpoint, logger, model)
 
-    #dataset = build_dataset(cfg.data.test, logger)
-    #dataloader = build_dataloader(dataset, training=False, dist=args.dist, **cfg.dataloader.test)
-
-    # (coord, feat, semantic_label, instance_label)
-    # labels are default to be zero
-
-    data = getData()
-
+    dataset = build_dataset(cfg.data.test, logger)
+    dataloader = build_dataloader(dataset, training=False, dist=args.dist, **cfg.dataloader.test)
+    results = []
+    scan_ids, coords, colors, sem_preds, sem_labels = [], [], [], [], []
+    offset_preds, offset_labels, inst_labels, pred_insts, gt_insts = [], [], [], [], []
+    _, world_size = get_dist_info()
+    progress_bar = tqdm(total=len(dataloader) * world_size, disable=not is_main_process())
     with torch.no_grad():
         model.eval()
-        result = model(data)
-        print(type(result))
-        print(result)
+        for i, batch in enumerate(dataloader):
+            result = model(batch)
+            results.append(result)
+            progress_bar.update(world_size)
+        progress_bar.close()
+        results = collect_results_gpu(results, len(dataset))
+    if is_main_process():
+        for res in results:
+            scan_ids.append(res['scan_id'])
+            coords.append(res['coords_float'])
+            colors.append(res['color_feats'])
+            sem_preds.append(res['semantic_preds'])
+            sem_labels.append(res['semantic_labels'])
+            offset_preds.append(res['offset_preds'])
+            offset_labels.append(res['offset_labels'])
+            inst_labels.append(res['instance_labels'])
+            if not cfg.model.semantic_only:
+                pred_insts.append(res['pred_instances'])
+                gt_insts.append(res['gt_instances'])
+        if not cfg.model.semantic_only:
+            logger.info('Evaluate instance segmentation')
+            eval_min_npoint = getattr(cfg, 'eval_min_npoint', None)
+            scannet_eval = ScanNetEval(dataset.CLASSES, eval_min_npoint)
+            scannet_eval.evaluate(pred_insts, gt_insts)
+        logger.info('Evaluate semantic segmentation and offset MAE')
+        ignore_label = cfg.model.ignore_label
+        evaluate_semantic_miou(sem_preds, sem_labels, ignore_label, logger)
+        evaluate_semantic_acc(sem_preds, sem_labels, ignore_label, logger)
+        evaluate_offset_mae(offset_preds, offset_labels, inst_labels, ignore_label, logger)
+
+        # save output
+        if not args.out:
+            return
+        logger.info('Save results')
+        save_npy(args.out, 'coords', scan_ids, coords)
+        save_npy(args.out, 'colors', scan_ids, colors)
+        if cfg.save_cfg.semantic:
+            save_npy(args.out, 'semantic_pred', scan_ids, sem_preds)
+            save_npy(args.out, 'semantic_label', scan_ids, sem_labels)
+        if cfg.save_cfg.offset:
+            save_npy(args.out, 'offset_pred', scan_ids, offset_preds)
+            save_npy(args.out, 'offset_label', scan_ids, offset_labels)
+        if cfg.save_cfg.instance:
+            nyu_id = dataset.NYU_ID
+            save_pred_instances(args.out, 'pred_instance', scan_ids, pred_insts, nyu_id)
+            save_gt_instances(args.out, 'gt_instance', scan_ids, gt_insts, nyu_id)
+
+
+if __name__ == '__main__':
+    main()

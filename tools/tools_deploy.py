@@ -47,3 +47,35 @@ def getXYZMiddle(xyz): #transform_test(xyz, rgb, semantic_label, instance_label,
     #instance_label = self.getCroppedInstLabel(instance_label, valid_idxs)
     return xyz_middle
 
+from torch.autograd import Function
+import softgroup.ops.ops as ops
+
+class Voxellization_Idx(Function):
+
+    @staticmethod
+    def forward(ctx, coords, batchsize, mode=4):
+        '''
+        :param ctx:
+        :param coords:  long (N, dimension + 1) or (N, dimension) dimension = 3
+        :param batchsize
+        :param mode: int 4=mean
+        :param dimension: int
+        :return: output_coords:  long (M, dimension + 1) (M <= N)
+        :return: output_map: int M * (maxActive + 1)
+        :return: input_map: int N
+        '''
+        assert coords.is_contiguous()
+        N = coords.size(0)
+        output_coords = coords.new()
+
+        input_map = torch.IntTensor(N).zero_()
+        output_map = input_map.new()
+
+        ops.voxelize_idx(coords, output_coords, input_map, output_map, batchsize, mode)
+        return output_coords, input_map, output_map
+
+    @staticmethod
+    def backward(ctx, a=None, b=None, c=None):
+        return None
+
+voxelization_idx = Voxellization_Idx.apply

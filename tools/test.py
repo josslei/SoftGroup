@@ -142,6 +142,7 @@ def main():
         evaluate_offset_mae(offset_preds, offset_labels, inst_labels, ignore_label, logger)
 
         # save output
+        print('\n=================\n' + args.out + '\n=================\n')
         if not args.out:
             return
         logger.info('Save results')
